@@ -1002,6 +1002,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                             }
                         }
                     } else {
+                        if(CONFIG.API.IS_CUSTOM_SSO) throw new Error(`自定义SSO令牌当前模型${model}的请求次数已失效`);
                         tokenManager.removeTokenFromModel(model, CONFIG.API.SIGNATURE_COOKIE.cookie);
                         if(tokenManager.getTokenCountForModel(model) === 0){
                             throw new Error(`${model} 次数已达上限，请切换其他模型或者重新对话`);
@@ -1027,6 +1028,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                             }
                         }
                     } else {
+                        if(CONFIG.API.IS_CUSTOM_SSO) throw new Error(`自定义SSO令牌当前模型${model}的请求次数已失效`);
                         tokenManager.removeTokenFromModel(model, CONFIG.API.SIGNATURE_COOKIE.cookie);
                         if(tokenManager.getTokenCountForModel(model) === 0){
                             throw new Error(`${model} 次数已达上限，请切换其他模型或者重新对话`);
@@ -1051,6 +1053,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                             }
                         }
                     } else {
+                        if(CONFIG.API.IS_CUSTOM_SSO) throw new Error(`自定义SSO令牌当前模型${model}的请求次数已失效`);
                         Logger.error(`令牌异常错误状态!status: ${response.status}`, 'Server');
                         tokenManager.removeTokenFromModel(model, CONFIG.API.SIGNATURE_COOKIE.cookie);
                         Logger.info(`当前${model}剩余可用令牌数: ${tokenManager.getTokenCountForModel(model)}`, 'Server');

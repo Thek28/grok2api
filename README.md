@@ -13,6 +13,7 @@
 ```bash
 docker run -it -d --name grok2api \
   -p 3000:3000 \
+  -e IS_TEMP_CONVERSATION=false \
   -e IS_TEMP_GROK2=true \
   -e GROK2_CONCURRENCY_LEVEL=4 \
   -e API_KEY=your_api_key \
@@ -36,6 +37,7 @@ services:
     ports:
       - "3000:3000"
     environment:
+      - IS_TEMP_CONVERSATION=false
       - IS_TEMP_GROK2=true
       - GROK2_CONCURRENCY_LEVEL=4
       - API_KEY=your_api_key
@@ -59,6 +61,7 @@ docker build -t yourusername/grok2api .
 ```bash
 docker run -it -d --name grok2api \
   -p 3000:3000 \
+  -e IS_TEMP_CONVERSATION=false \
   -e IS_TEMP_GROK2=true \
   -e GROK2_CONCURRENCY_LEVEL=4 \
   -e API_KEY=your_api_key \
@@ -76,6 +79,7 @@ docker run -it -d --name grok2api \
 
 |变量 | 说明 | 构建时是否必填 |示例|
 |--- | --- | ---| ---|
+|`IS_TEMP_CONVERSATION` | 是否开启临时会话，开启后会话历史记录不会保留在网页 | （可以不填，默认是false） | `true/false`|
 |`IS_TEMP_GROK2` | 是否开启无限临时账号的grok2，关闭则grok2相关模型是使用你自己的cookie账号的次数 | （可以不填，默认是true） | `true/false`|
 |`GROK2_CONCURRENCY_LEVEL` | grok2临时账号的并发控制，过高会被ban掉ip | （可以不填，默认是4） | `4`|
 |`API_KEY` | 自定义认证鉴权密钥 | （可以不填，默认是sk-123456） | `sk-123456`|
@@ -115,7 +119,13 @@ https://huggingface.co/spaces/yxmiler/GrokAPIService
 - `grok-3-imageGen`
 - `grok-3-deepsearch`
 - `grok-3-reasoning`
-- 
+
+### 模型可用次数参考
+- grok-2,grok-2-imageGen,grok-2-search 合计：20次  每2小时刷新
+- grok-3,grok-3-search,grok-3-imageGen 合计：20次  每2小时刷新
+- grok-3-deepsearch：10次 每24小时刷新
+- grok-3-reasoning：10次 每24小时刷新
+
 ### cookie的获取办法：
 1. 打开[grok官网](https://grok.com/)
 2. 复制如下的SSO的cookie的值填入SSO变量即可
