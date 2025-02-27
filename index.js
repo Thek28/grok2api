@@ -7,6 +7,7 @@ import puppeteer from 'puppeteer-extra'
 import StealthPlugin from 'puppeteer-extra-plugin-stealth'
 import { v4 as uuidv4 } from 'uuid';
 import Logger from './logger.js';
+import AsyncLock from 'async-lock';
 
 dotenv.config();
 
@@ -70,6 +71,7 @@ const DEFAULT_HEADERS = {
     'baggage': 'sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c'
 };
 
+const lock = new AsyncLock();
 
 async function initialization() {
     if (CONFIG.CHROME_PATH == null) {
@@ -274,10 +276,12 @@ class GrokTempCookieManager {
     }
 
     async ensureCookies() {
-        // 如果 cookies 数量不足，则重新获取
-        if (this.cookies.length < this.initialCookieCount) {
-            await this.refreshCookies();
-        }
+        await lock.acquire('cookieLock', async () => {
+            // 如果 cookies 数量不足，则重新获取
+            if (this.cookies.length < this.initialCookieCount) {
+                await this.refreshCookies();
+            }
+        });
     }
     async extractGrokHeaders(browser) {
         Logger.info("开始提取头信息", 'Server');
@@ -336,51 +340,50 @@ class GrokTempCookieManager {
         return Promise.all(cookiePromises);
     }
     async refreshCookies() {
-        if (this.isRefreshing) return;
-        this.isRefreshing = true;
-        this.extractCount = 0;
-        try {
-            // 获取新的 cookies
-            let retryCount = 0;
-            let remainingCount = this.initialCookieCount - this.cookies.length;
+        await lock.acquire('cookieLock', async () => {
+            if (this.isRefreshing) return;
+            this.isRefreshing = true;
+            this.extractCount = 0;
+            try {
+                // 获取新的 cookies
+                let retryCount = 0;
+                let remainingCount = this.initialCookieCount - this.cookies.length;
 
-            while (retryCount < CONFIG.RETRY.MAX_ATTEMPTS) {
-                await this.initializeTempCookies(remainingCount);
-                if (this.extractCount != remainingCount) {
-                    if (this.extractCount == 0) {
-                        Logger.error(`无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`);
-                    } else if (this.extractCount < remainingCount) {
-                        remainingCount -= this.extractCount;
-                        this.extractCount = 0;
-                        retryCount++;
-                        await Utils.delay(1000 * retryCount);
+                while (retryCount < CONFIG.RETRY.MAX_ATTEMPTS) {
+                    await this.initializeTempCookies(remainingCount);
+                    if (this.extractCount != remainingCount) {
+                        if (this.extractCount == 0) {
+                            Logger.error(`无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`);
+                        } else if (this.extractCount < remainingCount) {
+                            remainingCount -= this.extractCount;
+                            this.extractCount = 0;
+                            retryCount++;
+                            await Utils.delay(1000 * retryCount);
+                        } else {
+                            break;
+                        }
                     } else {
                         break;
                     }
-                } else {
-                    break;
                 }
-            }
-            if (this.currentIndex >= this.cookies.length) {
-                this.currentIndex = 0;
-            }
+                if (this.currentIndex >= this.cookies.length) {
+                    this.currentIndex = 0;
+                }
 
-            if (this.cookies.length < this.initialCookieCount) {
-                if (this.cookies.length !== 0) {
-                    // 如果已经获取到一些 TempCookies，则只提示警告错误
-                    Logger.error(`无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`);
-                } else {
-                    // 如果未获取到任何 TempCookies，则抛出错误
-                    throw new Error(`无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`);
+                if (this.cookies.length < this.initialCookieCount) {
+                    if (this.cookies.length !== 0) {
+                        Logger.error(`无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`);
+                    } else {
+                        throw new Error(`无法获取足够的有效 TempCookies，可能网络存在问题，当前数量：${this.cookies.length}`);
+                    }
                 }
+            } catch (error) {
+                Logger.error('刷新 cookies 失败:', error);
+            } finally {
+                Logger.info(`已提取${this.cookies.length}个TempCookies`, 'Server');
+                this.isRefreshing = false;
             }
-        } catch (error) {
-            Logger.error('刷新 cookies 失败:', error);
-        } finally {
-            Logger.info(`已提取${this.cookies.length}个TempCookies`, 'Server');
-            Logger.info(`提取的TempCookies为${JSON.stringify(this.cookies, null, 2)}`, 'Server');
-            this.isRefreshing = false;
-        }
+        });
     }
 }
 
@@ -889,153 +892,155 @@ app.get('/v1/models', (req, res) => {
 
 
 app.post('/v1/chat/completions', async (req, res) => {
-    try {
-        const authToken = req.headers.authorization?.replace('Bearer ', '');
-        if (CONFIG.API.IS_CUSTOM_SSO) {
-            if (authToken) {
-                const result = `sso=${authToken};ssp_rw=${authToken}`;
-                tokenManager.setToken(result);
-            } else {
-                return res.status(401).json({ error: '自定义的SSO令牌缺失' });
-            }
-        } else if (authToken !== CONFIG.API.API_KEY) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
-        let isTempCookie = req.body.model.includes("grok-2") && CONFIG.API.IS_TEMP_GROK2;
-        let retryCount = 0;
-        const grokClient = new GrokApiClient(req.body.model);
-        const requestPayload = await grokClient.prepareChatRequest(req.body);
-        Logger.info(`请求体: ${JSON.stringify(requestPayload, null, 2)}`, 'Server');
-
-        while (retryCount < CONFIG.RETRY.MAX_ATTEMPTS) {
-            retryCount++;
-            if (isTempCookie) {
-                CONFIG.API.SIGNATURE_COOKIE = CONFIG.API.TEMP_COOKIE;
-                Logger.info(`已切换为临时令牌`, 'Server');
-            } else {
-                CONFIG.API.SIGNATURE_COOKIE = await Utils.createAuthHeaders(req.body.model);
-            }
-            if (!CONFIG.API.SIGNATURE_COOKIE) {
-                throw new Error('该模型无可用令牌');
-            }
-            Logger.info(`当前令牌索引: ${CONFIG.SSO_INDEX}`, 'Server');
-            Logger.info(`当前令牌: ${JSON.stringify(CONFIG.API.SIGNATURE_COOKIE, null, 2)}`, 'Server');
-            const response = await fetch(`${CONFIG.API.BASE_URL}/rest/app-chat/conversations/new`, {
-                method: 'POST',
-                headers: {
-                    "accept": "text/event-stream",
-                    "baggage": "sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c",
-                    "content-type": "text/plain;charset=UTF-8",
-                    "Connection": "keep-alive",
-                    "cookie": CONFIG.API.SIGNATURE_COOKIE
-                },
-                body: JSON.stringify(requestPayload)
-            });
-
-            if (response.ok) {
-                Logger.info(`请求成功`, 'Server');
-                CONFIG.SSO_INDEX = (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
-                Logger.info(`当前剩余可用令牌数: ${tokenManager.getTokenCount()}`, 'Server');
-                try {
-                    await handleResponse(response, req.body.model, res, req.body.stream);
-                    Logger.info(`请求结束`, 'Server');
-                    return;
-                } catch (error) {
-                    Logger.error(error, 'Server');
-                    if (isTempCookie) {
-                        // 移除当前失效的 cookie
-                        tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
-                        if (tempCookieManager.cookies.length != 0) {
-                            tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
-                            CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
-                            tempCookieManager.ensureCookies()
-                        } else {
-                            try {
-                                await tempCookieManager.ensureCookies();
-                                tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
-                                CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
-                            } catch (error) {
-                                throw error;
-                            }
-                        }
-                    } else {
-                        tokenManager.setModelLimit(CONFIG.SSO_INDEX, req.body.model);
-                        for (let i = 1; i <= tokenManager.getTokenCount(); i++) {
-                            CONFIG.SSO_INDEX = (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
-                            if (!tokenManager.isTokenModelLimitReached(CONFIG.SSO_INDEX, req.body.model)) {
-                                break;
-                            } else if (i >= tokenManager.getTokenCount()) {
-                                throw new Error(`${req.body.model} 次数已达上限，请切换其他模型或者重新对话`);
-                            }
-                        }
-                    }
+    await lock.acquire('requestLock', async () => {
+        try {
+            const authToken = req.headers.authorization?.replace('Bearer ', '');
+            if (CONFIG.API.IS_CUSTOM_SSO) {
+                if (authToken) {
+                    const result = `sso=${authToken};ssp_rw=${authToken}`;
+                    tokenManager.setToken(result);
+                } else {
+                    return res.status(401).json({ error: '自定义的SSO令牌缺失' });
                 }
-            } else {
-                if (response.status === 429) {
-                    if (isTempCookie) {
-                        // 移除当前失效的 cookie
-                        tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
-                        if (tempCookieManager.cookies.length != 0) {
-                            tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
-                            CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
-                            tempCookieManager.ensureCookies()
-                        } else {
-                            try {
-                                await tempCookieManager.ensureCookies();
+            } else if (authToken !== CONFIG.API.API_KEY) {
+                return res.status(401).json({ error: 'Unauthorized' });
+            }
+            let isTempCookie = req.body.model.includes("grok-2") && CONFIG.API.IS_TEMP_GROK2;
+            let retryCount = 0;
+            const grokClient = new GrokApiClient(req.body.model);
+            const requestPayload = await grokClient.prepareChatRequest(req.body);
+            Logger.info(`请求体: ${JSON.stringify(requestPayload, null, 2)}`, 'Server');
+
+            while (retryCount < CONFIG.RETRY.MAX_ATTEMPTS) {
+                retryCount++;
+                if (isTempCookie) {
+                    CONFIG.API.SIGNATURE_COOKIE = CONFIG.API.TEMP_COOKIE;
+                    Logger.info(`已切换为临时令牌`, 'Server');
+                } else {
+                    CONFIG.API.SIGNATURE_COOKIE = await Utils.createAuthHeaders(req.body.model);
+                }
+                if (!CONFIG.API.SIGNATURE_COOKIE) {
+                    throw new Error('该模型无可用令牌');
+                }
+                Logger.info(`当前令牌索引: ${CONFIG.SSO_INDEX}`, 'Server');
+                Logger.info(`当前令牌: ${JSON.stringify(CONFIG.API.SIGNATURE_COOKIE, null, 2)}`, 'Server');
+                const response = await fetch(`${CONFIG.API.BASE_URL}/rest/app-chat/conversations/new`, {
+                    method: 'POST',
+                    headers: {
+                        "accept": "text/event-stream",
+                        "baggage": "sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c",
+                        "content-type": "text/plain;charset=UTF-8",
+                        "Connection": "keep-alive",
+                        "cookie": CONFIG.API.SIGNATURE_COOKIE
+                    },
+                    body: JSON.stringify(requestPayload)
+                });
+
+                if (response.ok) {
+                    Logger.info(`请求成功`, 'Server');
+                    CONFIG.SSO_INDEX = (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
+                    Logger.info(`当前剩余可用令牌数: ${tokenManager.getTokenCount()}`, 'Server');
+                    try {
+                        await handleResponse(response, req.body.model, res, req.body.stream);
+                        Logger.info(`请求结束`, 'Server');
+                        return;
+                    } catch (error) {
+                        Logger.error(error, 'Server');
+                        if (isTempCookie) {
+                            // 移除当前失效的 cookie
+                            tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
+                            if (tempCookieManager.cookies.length != 0) {
                                 tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
                                 CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
-                            } catch (error) {
-                                throw error;
+                                tempCookieManager.ensureCookies()
+                            } else {
+                                try {
+                                    await tempCookieManager.ensureCookies();
+                                    tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
+                                    CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
+                                } catch (error) {
+                                    throw error;
+                                }
                             }
-                        }
-                    } else {
-                        tokenManager.setModelLimit(CONFIG.SSO_INDEX, req.body.model);
-                        for (let i = 1; i <= tokenManager.getTokenCount(); i++) {
-                            CONFIG.SSO_INDEX = (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
-                            if (!tokenManager.isTokenModelLimitReached(CONFIG.SSO_INDEX, req.body.model)) {
-                                break;
-                            } else if (i >= tokenManager.getTokenCount()) {
-                                throw new Error(`${req.body.model} 次数已达上限，请切换其他模型或者重新对话`);
+                        } else {
+                            tokenManager.setModelLimit(CONFIG.SSO_INDEX, req.body.model);
+                            for (let i = 1; i <= tokenManager.getTokenCount(); i++) {
+                                CONFIG.SSO_INDEX = (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
+                                if (!tokenManager.isTokenModelLimitReached(CONFIG.SSO_INDEX, req.body.model)) {
+                                    break;
+                                } else if (i >= tokenManager.getTokenCount()) {
+                                    throw new Error(`${req.body.model} 次数已达上限，请切换其他模型或者重新对话`);
+                                }
                             }
                         }
                     }
                 } else {
-                    // 非429错误直接抛出
-                    if (isTempCookie) {
-                        // 移除当前失效的 cookie
-                        tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
-                        if (tempCookieManager.cookies.length != 0) {
-                            tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
-                            CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
-                            tempCookieManager.ensureCookies()
-                        } else {
-                            try {
-                                await tempCookieManager.ensureCookies();
+                    if (response.status === 429) {
+                        if (isTempCookie) {
+                            // 移除当前失效的 cookie
+                            tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
+                            if (tempCookieManager.cookies.length != 0) {
                                 tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
                                 CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
-                            } catch (error) {
-                                throw error;
+                                tempCookieManager.ensureCookies()
+                            } else {
+                                try {
+                                    await tempCookieManager.ensureCookies();
+                                    tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
+                                    CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
+                                } catch (error) {
+                                    throw error;
+                                }
+                            }
+                        } else {
+                            tokenManager.setModelLimit(CONFIG.SSO_INDEX, req.body.model);
+                            for (let i = 1; i <= tokenManager.getTokenCount(); i++) {
+                                CONFIG.SSO_INDEX = (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
+                                if (!tokenManager.isTokenModelLimitReached(CONFIG.SSO_INDEX, req.body.model)) {
+                                    break;
+                                } else if (i >= tokenManager.getTokenCount()) {
+                                    throw new Error(`${req.body.model} 次数已达上限，请切换其他模型或者重新对话`);
+                                }
                             }
                         }
                     } else {
-                        Logger.error(`令牌异常错误状态!status: ${response.status}， 已移除当前令牌${CONFIG.SSO_INDEX.cookie}`, 'Server');
-                        tokenManager.removeTokenByIndex(CONFIG.SSO_INDEX);
-                        Logger.info(`当前剩余可用令牌数: ${tokenManager.getTokenCount()}`, 'Server');
-                        CONFIG.SSO_INDEX = (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
+                        // 非429错误直接抛出
+                        if (isTempCookie) {
+                            // 移除当前失效的 cookie
+                            tempCookieManager.cookies.splice(tempCookieManager.currentIndex, 1);
+                            if (tempCookieManager.cookies.length != 0) {
+                                tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
+                                CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
+                                tempCookieManager.ensureCookies()
+                            } else {
+                                try {
+                                    await tempCookieManager.ensureCookies();
+                                    tempCookieManager.currentIndex = tempCookieManager.currentIndex % tempCookieManager.cookies.length;
+                                    CONFIG.API.TEMP_COOKIE = tempCookieManager.cookies[tempCookieManager.currentIndex];
+                                } catch (error) {
+                                    throw error;
+                                }
+                            }
+                        } else {
+                            Logger.error(`令牌异常错误状态!status: ${response.status}， 已移除当前令牌${CONFIG.SSO_INDEX.cookie}`, 'Server');
+                            tokenManager.removeTokenByIndex(CONFIG.SSO_INDEX);
+                            Logger.info(`当前剩余可用令牌数: ${tokenManager.getTokenCount()}`, 'Server');
+                            CONFIG.SSO_INDEX = (CONFIG.SSO_INDEX + 1) % tokenManager.getTokenCount();
+                        }
                     }
                 }
             }
+            throw new Error('当前模型所有令牌都已耗尽');
+        } catch (error) {
+            Logger.error(error, 'ChatAPI');
+            res.status(500).json({
+                error: {
+                    message: error.message || error,
+                    type: 'server_error'
+                }
+            });
         }
-        throw new Error('当前模型所有令牌都已耗尽');
-    } catch (error) {
-        Logger.error(error, 'ChatAPI');
-        res.status(500).json({
-            error: {
-                message: error.message || error,
-                type: 'server_error'
-            }
-        });
-    }
+    });
 });
 
 
